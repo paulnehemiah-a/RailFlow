@@ -817,7 +817,7 @@ Experience the RailFlow platform:
 
 > 📚 **API Documentation:** `YOUR_BACKEND_URL/docs`
 
-> 💻 **GitHub Repository:** `YOUR_GITHUB_REPOSITORY_URL`
+> 💻 **GitHub Repository:** `[YOUR_GITHUB_REPOSITORY_URL](https://github.com/paulnehemiah-a/RailFlow)`
 
 > 🎬 **Demo Video:** `YOUR_DEMO_VIDEO_URL`
 
