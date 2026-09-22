@@ -1,0 +1,193 @@
+"""
+Block Planning Option Scorer (XGBoost)
+---------------------------------------
+Loads your real train schedule / block-gap CSVs, engineers features per
+candidate maintenance block, trains an XGBoost regressor to predict a
+0-100 "block suitability score", then prints a ranked list of block
+planning options (Option A/B/C style) with scores + rationale.
+
+Run: python block_planning_xgboost.py
+Requires the 3 CSVs in the same folder:
+  train_enhanced_schedule.csv
+  train_block_assignments.csv
+  train_block_gaps_analysis.csv
+"""
+import numpy as np
+import pandas as pd
+from xgboost import XGBRegressor
+
+pd.set_option("display.width", 140)
+pd.set_option("display.max_columns", 20)
+
+SCHEDULE_CSV = "train_enhanced_schedule.csv"
+ASSIGNMENTS_CSV = "train_block_assignments.csv"
+GAPS_CSV = "train_block_gaps_analysis.csv"
+
+RNG = np.random.RandomState(42)
+
+
+# ---------------------------------------------------------------------
+# 1. Load real data
+# ---------------------------------------------------------------------
+def load_data():
+    schedule = pd.read_csv(SCHEDULE_CSV)
+    assignments = pd.read_csv(ASSIGNMENTS_CSV)
+    gaps = pd.read_csv(GAPS_CSV)
+    return schedule, assignments, gaps
+
+
+# ---------------------------------------------------------------------
+# 2. Feature engineering per candidate block (real, derived from the CSVs)
+# ---------------------------------------------------------------------
+def build_block_features(schedule: pd.DataFrame, assignments: pd.DataFrame) -> pd.DataFrame:
+    # Traffic density per route_line: how many trains actually run on it
+    route_traffic = schedule.groupby("route_line")["train_number"].count().rename("route_traffic")
+
+    # Hour-of-day the block sits in (use train_1's departure_mins as the anchor time)
+    dep_lookup = schedule.set_index("train_number")["departure_mins"].to_dict()
+    arr_lookup = schedule.set_index("train_number")["arrival_mins"].to_dict()
+
+    rows = []
+    for _, b in assignments.iterrows():
+        route = b["route_line"]
+        train_1 = b["train_1"]
+        train_2 = b["train_2"] if b["train_2"] != "-" else None
+        gap_minutes = int(b["gap_minutes"])
+        gap_status = b["gap_status"]
+
+        anchor_mins = arr_lookup.get(train_1, dep_lookup.get(train_1, 720))
+        hour_of_day = (anchor_mins // 60) % 24
+
+        is_solo = 1 if gap_status == "Solo" else 0
+        is_critical = 1 if gap_status == "Critical" else 0
+        is_adequate = 1 if gap_status not in ("Solo", "Critical") else 0
+
+        traffic = int(route_traffic.get(route, 1))
+
+        # Effective usable window: Solo blocks are treated as a full open
+        # overnight/off-peak maintenance corridor (240 min standard window);
+        # paired blocks use their real computed gap_minutes.
+        effective_window_minutes = 240 if is_solo else gap_minutes
+
+        rows.append({
+            "block_id": b["block_id"],
+            "route_line": route,
+            "train_1": train_1,
+            "train_2": train_2 or "-",
+            "gap_minutes": gap_minutes,
+            "effective_window_minutes": effective_window_minutes,
+            "gap_status": gap_status,
+            "is_solo": is_solo,
+            "is_critical": is_critical,
+            "is_adequate": is_adequate,
+            "route_traffic": traffic,
+            "hour_of_day": int(hour_of_day),
+            "optimization_needed": 1 if str(b.get("optimization_needed", "No")).strip() == "Yes" else 0,
+        })
+
+    return pd.DataFrame(rows)
+
+
+# ---------------------------------------------------------------------
+# 3. Synthetic-but-domain-driven training labels
+#    (no real "quality" ground truth exists yet, so we encode railway
+#    domain logic into a target score and let XGBoost learn the mapping
+#    from features -> score; swap this for real planned-vs-actual
+#    outcomes once you're logging them from production use.)
+# ---------------------------------------------------------------------
+def domain_quality_score(row) -> float:
+    if row["is_critical"]:
+        base = 5.0  # near-zero safe margin -> effectively unusable without a full re-plan
+    elif row["is_solo"]:
+        base = 78.0  # whole corridor free -> strong candidate
+    else:
+        # scales with how much slack the gap gives beyond a 60-min safety buffer
+        base = 40.0 + min(40.0, (row["effective_window_minutes"] - 60) * 0.5)
+
+    # Off-peak bonus (00:00-05:00 and 22:00-24:00 preferred for blocks)
+    if row["hour_of_day"] <= 5 or row["hour_of_day"] >= 22:
+        base += 12.0
+    elif 9 <= row["hour_of_day"] <= 18:
+        base -= 8.0  # daytime peak, more disruptive
+
+    # High-traffic routes are riskier to block -> small penalty
+    base -= min(15.0, row["route_traffic"] * 1.2)
+
+    noise = RNG.normal(0, 4)
+    return float(np.clip(base + noise, 0, 100))
+
+
+# ---------------------------------------------------------------------
+# 4. Train XGBoost
+# ---------------------------------------------------------------------
+FEATURES = [
+    "gap_minutes", "effective_window_minutes", "is_solo", "is_critical",
+    "is_adequate", "route_traffic", "hour_of_day", "optimization_needed",
+]
+
+
+def train_model(df: pd.DataFrame) -> XGBRegressor:
+    df["quality_score"] = df.apply(domain_quality_score, axis=1)
+
+    X = df[FEATURES].values
+    y = df["quality_score"].values
+
+    model = XGBRegressor(
+        n_estimators=150,
+        max_depth=4,
+        learning_rate=0.08,
+        random_state=42,
+        eval_metric="rmse",
+    )
+    model.fit(X, y)
+    return model
+
+
+# ---------------------------------------------------------------------
+# 5. Score every candidate block and print ranked planning options
+# ---------------------------------------------------------------------
+def print_options(df: pd.DataFrame, model: XGBRegressor, top_n: int = 5):
+    X = df[FEATURES].values
+    df["xgb_score"] = np.clip(model.predict(X), 0, 100).round(1)
+
+    df["feasible"] = df["is_critical"] == 0
+    df["label"] = np.where(
+        df["is_critical"] == 1, "NOT RECOMMENDED (unsafe gap)",
+        np.where(df["xgb_score"] >= 70, "RECOMMENDED",
+                 np.where(df["xgb_score"] >= 45, "VIABLE", "MARGINAL")),
+    )
+
+    ranked = df.sort_values("xgb_score", ascending=False).reset_index(drop=True)
+
+    print("=" * 100)
+    print("BLOCK PLANNING OPTIONS — XGBoost Suitability Ranking")
+    print("=" * 100)
+
+    option_letters = ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J"]
+    for i, row in ranked.head(top_n).iterrows():
+        letter = option_letters[i] if i < len(option_letters) else str(i + 1)
+        print(f"\nOption {letter}: {row['block_id']}  ({row['route_line']})")
+        print(f"  Trains          : {row['train_1']}"
+              + (f" -> {row['train_2']}" if row["train_2"] != "-" else " (solo route, no crossing train)"))
+        print(f"  Gap status      : {row['gap_status']}  |  gap_minutes={row['gap_minutes']}  "
+              f"|  effective_window={row['effective_window_minutes']} min")
+        print(f"  Hour of day     : {row['hour_of_day']:02d}:00  |  route_traffic={row['route_traffic']} trains")
+        print(f"  XGBoost score   : {row['xgb_score']}/100  ->  {row['label']}")
+
+    print("\n" + "-" * 100)
+    print("FULL RANKED TABLE (all candidate blocks)")
+    print("-" * 100)
+    print(ranked[["block_id", "route_line", "gap_status", "gap_minutes",
+                  "hour_of_day", "route_traffic", "xgb_score", "label"]].to_string(index=False))
+
+    print("\n" + "-" * 100)
+    print("Feature importance (what XGBoost weighted most heavily):")
+    for feat, imp in sorted(zip(FEATURES, model.feature_importances_), key=lambda x: -x[1]):
+        print(f"  {feat:28s} {imp:.3f}")
+
+
+if __name__ == "__main__":
+    schedule, assignments, gaps = load_data()
+    features_df = build_block_features(schedule, assignments)
+    model = train_model(features_df)
+    print_options(features_df, model, top_n=5)
